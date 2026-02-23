@@ -16,6 +16,7 @@ type MLXEngine struct {
 	apiURL    string
 	modelName string
 	client    *http.Client
+	ctxMgr    *ContextManager
 }
 
 // AnalysisResult is the structure we expect from the LLM.
@@ -48,16 +49,24 @@ type choice struct {
 
 // NewMLXEngine creates a new instance of the engine.
 // apiURL should be the base URL, e.g., "http://localhost:8080/v1"
-// modelName is the model identifier to send in the request (e.g. "mlx-community/Llama-3.2-1B-Instruct-4bit")
-func NewMLXEngine(apiURL, modelName string) (*MLXEngine, error) {
+// modelName is the model identifier to send in the request
+// maxTokens is the context window size
+func NewMLXEngine(apiURL, modelName string, maxTokens int) (*MLXEngine, error) {
 	if apiURL == "" {
 		apiURL = "http://localhost:8080/v1"
 	}
-	// Ensure URL ends with /chat/completions if not provided, or handle base URL.
-	// Standard OpenAI SDKs take base URL. Here we'll just construct the full endpoint.
+	// Ensure URL ends with /chat/completions if not provided
 	if !strings.HasSuffix(apiURL, "/chat/completions") {
 		apiURL = strings.TrimRight(apiURL, "/") + "/chat/completions"
 	}
+
+	tokenizer, err := NewTokenizer(modelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize tokenizer: %w", err)
+	}
+
+	// Use provided max tokens for context management
+	ctxMgr := NewContextManager(tokenizer, maxTokens)
 
 	return &MLXEngine{
 		apiURL:    apiURL,
@@ -65,6 +74,7 @@ func NewMLXEngine(apiURL, modelName string) (*MLXEngine, error) {
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+		ctxMgr: ctxMgr,
 	}, nil
 }
 
@@ -75,6 +85,24 @@ func (e *MLXEngine) Categorize(ctx context.Context, text string) (*AnalysisResul
 Required format: {"category": "Specific_Category_Name", "title": "Clean_Filename_No_Ext"}
 Categories examples: Algorithms, Systems, AI, Math, Python, Cpp, Web, Data_Structures, Interviews, Research, Networking, Database, Security.
 Do NOT return a list. Do NOT return markdown. Do NOT return extra text.`
+
+	systemBudget, _, contentBudget, _ := e.ctxMgr.GetBudgets()
+
+	// Truncate system prompt to its budget if necessary (unlikely but safe)
+	systemPrompt = e.ctxMgr.Truncate(systemPrompt, systemBudget, StrategySlidingWindow)
+
+	// Truncate user text or use Map-Reduce if it's too large
+	currentTokens := e.ctxMgr.tokenizer.CountTokens(text)
+	if currentTokens > contentBudget {
+		// Try Map-Reduce summarization first
+		summary, err := e.MapReduceSummarize(ctx, text, contentBudget)
+		if err != nil {
+			// Fallback to Middle Extraction if Map-Reduce fails
+			text = e.ctxMgr.Truncate(text, contentBudget, StrategyMiddleExtraction)
+		} else {
+			text = summary
+		}
+	}
 
 	userPrompt := fmt.Sprintf("Document text snippet:\n%s", text)
 
@@ -184,6 +212,88 @@ func SanitizeFilename(s string) string {
 		result = "unnamed"
 	}
 	return result
+}
+
+// MapReduceSummarize reduces a large text into a shorter summary that fits within limit tokens.
+func (e *MLXEngine) MapReduceSummarize(ctx context.Context, text string, limit int) (string, error) {
+	currentTokens := e.ctxMgr.tokenizer.CountTokens(text)
+	if currentTokens <= limit {
+		return text, nil
+	}
+
+	// 1. Chunking: Split text into chunks that fit in the model's window
+	// We use 80% of content budget for chunks to leave room for the summarization prompt
+	_, _, contentBudget, _ := e.ctxMgr.GetBudgets()
+	chunkSize := int(float64(contentBudget) * 0.8)
+	chunks := e.ctxMgr.Chunk(text, chunkSize)
+
+	// 2. Map: Summarize each chunk
+	var summaries []string
+	for i, chunk := range chunks {
+		summary, err := e.summarizeChunk(ctx, chunk, i+1, len(chunks))
+		if err != nil {
+			return "", fmt.Errorf("failed to summarize chunk %d/%d: %w", i+1, len(chunks), err)
+		}
+		summaries = append(summaries, summary)
+	}
+
+	// 3. Reduce: Combine and recursively summarize if needed
+	combined := strings.Join(summaries, "\n\n")
+	combinedTokens := e.ctxMgr.tokenizer.CountTokens(combined)
+
+	if combinedTokens > limit {
+		// Recursive reduction
+		return e.MapReduceSummarize(ctx, combined, limit)
+	}
+
+	return combined, nil
+}
+
+func (e *MLXEngine) summarizeChunk(ctx context.Context, text string, index, total int) (string, error) {
+	prompt := fmt.Sprintf("Summarize the following document part (%d/%d). Keep key technical details, names, and core topics relevant for categorization:\n\n%s", index, total, text)
+
+	reqBody := chatRequest{
+		Model: e.modelName,
+		Messages: []message{
+			{Role: "system", Content: "You are a concise summarization assistant. Provide a brief but information-dense summary."},
+			{Role: "user", Content: prompt},
+		},
+		Stream:      false,
+		Temperature: 0.1,
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", e.apiURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("server error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var chatResp chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return "", err
+	}
+
+	if len(chatResp.Choices) == 0 {
+		return "", fmt.Errorf("no response from model")
+	}
+
+	return strings.TrimSpace(chatResp.Choices[0].Message.Content), nil
 }
 
 // cleanJSON attempts to extract the valid JSON object

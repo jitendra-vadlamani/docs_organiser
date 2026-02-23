@@ -79,6 +79,13 @@ func extractPlainText(path string, limit int) (string, error) {
 	}
 	defer f.Close()
 
+	// We don't want to allocate a massive buffer if the file is small.
+	// We'll read the whole file if it's smaller than the limit.
+	stat, err := f.Stat()
+	if err == nil && int(stat.Size()) < limit {
+		limit = int(stat.Size())
+	}
+
 	buf := make([]byte, limit)
 	n, err := f.Read(buf)
 	if err != nil && err != io.EOF {

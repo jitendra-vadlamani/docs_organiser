@@ -17,10 +17,11 @@ import (
 )
 
 type Pipeline struct {
-	SourceDir string
-	DestDir   string
-	AI        *ai.MLXEngine
-	Workers   int
+	SourceDir    string
+	DestDir      string
+	AI           *ai.MLXEngine
+	Workers      int
+	ExtractLimit int
 
 	// Progress counters
 	TotalFiles     int32
@@ -32,15 +33,19 @@ type FileJob struct {
 	Path string
 }
 
-func NewPipeline(src, dst string, aiEngine *ai.MLXEngine, workers int) *Pipeline {
+func NewPipeline(src, dst string, aiEngine *ai.MLXEngine, workers, extractLimit int) *Pipeline {
 	if workers <= 0 {
 		workers = 5
 	}
+	if extractLimit <= 0 {
+		extractLimit = 100000
+	}
 	return &Pipeline{
-		SourceDir: src,
-		DestDir:   dst,
-		AI:        aiEngine,
-		Workers:   workers,
+		SourceDir:    src,
+		DestDir:      dst,
+		AI:           aiEngine,
+		Workers:      workers,
+		ExtractLimit: extractLimit,
 	}
 }
 
@@ -125,7 +130,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 }
 
 func (p *Pipeline) processFile(ctx context.Context, path string) {
-	text, err := extractor.ExtractText(path, 2000)
+	text, err := extractor.ExtractText(path, p.ExtractLimit)
 	if err != nil {
 		log.Printf("[!] Failed to extract text from %s: %v", filepath.Base(path), err)
 		atomic.AddInt32(&p.FailedFiles, 1)

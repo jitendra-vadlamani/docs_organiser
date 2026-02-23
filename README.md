@@ -51,26 +51,50 @@ make build
 make install
 ```
 
-## 3. Usage
+Run the tool with source and destination directories. You can also customize processing limits via flags, environment variables, or a YAML configuration file.
 
-Run the tool with the source and destination directories. Wrap paths in quotes if they contain spaces.
-
+### Quick Start
 ```bash
-./docs_organiser \
-  -src "/Path/To/Your/Messy Docs" \
-  -dst "/Path/To/Organized Docs" \
-  -workers 5
+./docs_organiser -src "./messy" -dst "./clean"
 ```
 
-### Flags
+### Using a Config File
+The application automatically looks for a `config.yaml` in the current directory. You can also specify a custom path:
+```bash
+./docs_organiser -config ./my-config.yaml
+```
 
-| Flag | Description | Default |
-| :--- | :--- | :--- |
-| `-src` | Source directory to scan (recursive) | **Required** |
-| `-dst` | Destination directory to move files | **Required** |
-| `-workers` | Number of concurrent workers | `5` |
-| `-api` | URL of the MLX server | `http://localhost:8080/v1` |
-| `-model` | Model name sent in API request | `mlx-community/Llama-3.2-1B-Instruct-4bit` |
+### Configuration Options
+
+You can configure the application using CLI flags, a YAML file, or environment variables. 
+
+**Precedence Order:**
+1. **CLI Flags** (Highest)
+2. **YAML Config File**
+3. **Environment Variables**
+4. **Default Values** (Lowest)
+
+| Flag | Environment Variable | YAML Key | Description | Default |
+| :--- | :--- | :--- | :--- | :--- |
+| `-src` | `DOCS_SRC` | `src` | Source directory (recursive) | **Required** |
+| `-dst` | `DOCS_DST` | `dst` | Destination directory | **Required** |
+| `-config`| - | - | Path to custom YAML config | `config.yaml` |
+| `-ctx` | `DOCS_CTX` | `ctx` | Model context window size (tokens)| `4096` |
+| `-limit` | `DOCS_LIMIT` | `limit` | Max extraction (chars) | `100000` |
+| `-workers`| `DOCS_WORKERS`| `workers`| Processing workers | `5` |
+| `-api` | `DOCS_API` | `api` | MLX server URL | `localhost:8080` |
+| `-model` | `DOCS_MODEL` | `model` | AI Model name | `Llama-3.2-1B` |
+
+#### Example using Flags:
+```bash
+./docs_organiser -src "./messy" -dst "./clean" -ctx 8192
+```
+
+#### Example using Environment Variables:
+```bash
+export DOCS_LIMIT=200000
+./docs_organiser -src "./messy" -dst "./clean"
+```
 
 > [!NOTE]
 > Detailed logs have been removed for a cleaner production terminal experience. Progress is shown in real-time.

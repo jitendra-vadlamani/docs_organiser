@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -11,22 +10,20 @@ import (
 	"time"
 
 	"docs_organiser/internal/ai"
+	"docs_organiser/internal/config"
 	"docs_organiser/internal/pipeline"
 )
 
 func main() {
-	// Parse CLI flags
-	sourceDir := flag.String("src", "", "Source directory to scan for files")
-	destDir := flag.String("dst", "", "Destination directory to move files into")
-	apiURL := flag.String("api", "http://localhost:8080/v1", "URL of the MLX server")
-	modelName := flag.String("model", "mlx-community/Llama-3.2-1B-Instruct-4bit", "Model name to use in API requests")
-	workers := flag.Int("workers", 5, "Number of concurrent workers")
-	flag.Parse()
+	// Load configuration using Viper
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
 
-	// Validate flags
-	if *sourceDir == "" || *destDir == "" {
-		fmt.Println("Usage: docs_organiser -src <source_dir> -dst <dest_dir> [-api <url>] [-model <name>] [-workers <n>]")
-		flag.PrintDefaults()
+	// Validate required fields
+	if cfg.SourceDir == "" || cfg.DestDir == "" {
+		fmt.Println("Usage: docs_organiser -src <source_dir> -dst <dest_dir> [-api <url>] [-model <name>] [-ctx <n>] [-workers <n>] [-limit <n>]")
 		os.Exit(1)
 	}
 
@@ -35,23 +32,25 @@ func main() {
 	defer stop()
 
 	fmt.Println("=== MLX File Mover (Production Ready) ===")
-	fmt.Printf("Source:      %s\n", *sourceDir)
-	fmt.Printf("Destination: %s\n", *destDir)
-	fmt.Printf("API URL:     %s\n", *apiURL)
-	fmt.Printf("Model:       %s\n", *modelName)
-	fmt.Printf("Workers:     %d\n", *workers)
+	fmt.Printf("Source:      %s\n", cfg.SourceDir)
+	fmt.Printf("Destination: %s\n", cfg.DestDir)
+	fmt.Printf("API URL:     %s\n", cfg.APIURL)
+	fmt.Printf("Model:       %s\n", cfg.ModelName)
+	fmt.Printf("Context:     %d tokens\n", cfg.ContextWindow)
+	fmt.Printf("Limit:       %d characters\n", cfg.ExtractLimit)
+	fmt.Printf("Workers:     %d\n", cfg.Workers)
 	fmt.Println("-----------------------------------------")
 
 	// Initialize AI Engine
 	fmt.Println("[*] Initializing AI Engine...")
-	aiEngine, err := ai.NewMLXEngine(*apiURL, *modelName)
+	aiEngine, err := ai.NewMLXEngine(cfg.APIURL, cfg.ModelName, cfg.ContextWindow)
 	if err != nil {
 		log.Fatalf("Failed to initialize AI engine: %v", err)
 	}
 	fmt.Println("[+] AI Engine initialized.")
 
 	// Initialize and Run Pipeline
-	p := pipeline.NewPipeline(*sourceDir, *destDir, aiEngine, *workers)
+	p := pipeline.NewPipeline(cfg.SourceDir, cfg.DestDir, aiEngine, cfg.Workers, cfg.ExtractLimit)
 
 	fmt.Println("[*] Starting processing pipeline...")
 	startTime := time.Now()
