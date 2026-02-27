@@ -16,3 +16,7 @@ limit: 100000   # Max characters to extract per file
 
 # Performance
 workers: 5      # Number of concurrent processing workers
+
+# Categories (Optional)
+# If empty, the system automatically discovers categories from the dst directory.
+# categories: ["Personal", "Work", "Finance", "Health", "Education"]

@@ -13,16 +13,24 @@ import (
 
 // MLXEngine handles interaction with the MLX model server.
 type MLXEngine struct {
-	apiURL    string
-	modelName string
-	client    *http.Client
-	ctxMgr    *ContextManager
+	apiURL          string
+	modelName       string
+	client          *http.Client
+	ctxMgr          *ContextManager
+	validCategories []string
 }
 
 // AnalysisResult is the structure we expect from the LLM.
 type AnalysisResult struct {
-	Category string `json:"category"`
-	Title    string `json:"title"`
+	Category        string  `json:"category"`
+	Title           string  `json:"title"`
+	ConfidenceScore float64 `json:"confidence_score"`
+}
+
+// DefaultCategories defines the fallback destination folders.
+var DefaultCategories = []string{
+	"Personal", "Work", "Finance", "Health", "Education", "Technical",
+	"Travel", "Legal", "Projects", "Receipts", "Misc",
 }
 
 // OpenAI-compatible request structure
@@ -51,7 +59,8 @@ type choice struct {
 // apiURL should be the base URL, e.g., "http://localhost:8080/v1"
 // modelName is the model identifier to send in the request
 // maxTokens is the context window size
-func NewMLXEngine(apiURL, modelName string, maxTokens int) (*MLXEngine, error) {
+// encodingName is the tiktoken encoding to use for token counting
+func NewMLXEngine(apiURL, modelName string, maxTokens int, encodingName string) (*MLXEngine, error) {
 	if apiURL == "" {
 		apiURL = "http://localhost:8080/v1"
 	}
@@ -60,7 +69,7 @@ func NewMLXEngine(apiURL, modelName string, maxTokens int) (*MLXEngine, error) {
 		apiURL = strings.TrimRight(apiURL, "/") + "/chat/completions"
 	}
 
-	tokenizer, err := NewTokenizer(modelName)
+	tokenizer, err := NewTokenizer(encodingName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize tokenizer: %w", err)
 	}
@@ -74,30 +83,34 @@ func NewMLXEngine(apiURL, modelName string, maxTokens int) (*MLXEngine, error) {
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 		},
-		ctxMgr: ctxMgr,
+		ctxMgr:          ctxMgr,
+		validCategories: DefaultCategories,
 	}, nil
 }
 
-// Categorize analyzes the text and returns a folder category and cleaned filename.
+// SetCategories overrides the allowed categorization folders.
+func (e *MLXEngine) SetCategories(categories []string) {
+	if len(categories) > 0 {
+		e.validCategories = categories
+	}
+}
+
 // Categorize analyzes the text and returns a folder category and cleaned filename.
 func (e *MLXEngine) Categorize(ctx context.Context, text string) (*AnalysisResult, error) {
-	systemPrompt := `You are a file organization assistant for Computer Science documents. Analyze the document text and return a SINGLE JSON object.
-Required format: {"category": "Specific_Category_Name", "title": "Clean_Filename_No_Ext"}
-Categories examples: Algorithms, Systems, AI, Math, Python, Cpp, Web, Data_Structures, Interviews, Research, Networking, Database, Security.
-Do NOT return a list. Do NOT return markdown. Do NOT return extra text.`
+	systemPrompt := fmt.Sprintf(`You are an intelligent file organization assistant. Analyze the document text and return a SINGLE JSON object.
+Required format: {"category": "Specific_Category_Name", "title": "Clean_Filename_No_Ext", "confidence_score": 0.0-1.0}
+Strictly choose category from: %s
+Nested paths like "Parent/Child" are valid if they exist in the list above.
+Required confidence_score: a float between 0.0 and 1.0.
+Do NOT return extra fields. Do NOT return markdown. Do NOT return extra text.`, strings.Join(e.validCategories, ", "))
 
 	systemBudget, _, contentBudget, _ := e.ctxMgr.GetBudgets()
-
-	// Truncate system prompt to its budget if necessary (unlikely but safe)
 	systemPrompt = e.ctxMgr.Truncate(systemPrompt, systemBudget, StrategySlidingWindow)
 
-	// Truncate user text or use Map-Reduce if it's too large
 	currentTokens := e.ctxMgr.tokenizer.CountTokens(text)
 	if currentTokens > contentBudget {
-		// Try Map-Reduce summarization first
 		summary, err := e.MapReduceSummarize(ctx, text, contentBudget)
 		if err != nil {
-			// Fallback to Middle Extraction if Map-Reduce fails
 			text = e.ctxMgr.Truncate(text, contentBudget, StrategyMiddleExtraction)
 		} else {
 			text = summary
@@ -106,16 +119,53 @@ Do NOT return a list. Do NOT return markdown. Do NOT return extra text.`
 
 	userPrompt := fmt.Sprintf("Document text snippet:\n%s", text)
 
-	reqBody := chatRequest{
-		Model: e.modelName,
-		Messages: []message{
+	var lastErr error
+	maxRetries := 2
+
+	// Correction loop
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		messages := []message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
-		},
-		Stream:      false,
-		Temperature: 0.1, // Low temperature for deterministic output
+		}
+
+		// If this is a retry, inject the previous error
+		if attempt > 0 && lastErr != nil {
+			messages = append(messages, message{
+				Role:    "assistant",
+				Content: "Previous attempt failed validation.",
+			})
+			messages = append(messages, message{
+				Role:    "user",
+				Content: fmt.Sprintf("Your previous response was invalid: %v. Please provide a strictly valid JSON object following the schema.", lastErr),
+			})
+		}
+
+		reqBody := chatRequest{
+			Model:       e.modelName,
+			Messages:    messages,
+			Stream:      false,
+			Temperature: 0.1,
+		}
+
+		result, err := e.executeCategorization(ctx, reqBody)
+		if err == nil {
+			return result, nil
+		}
+
+		lastErr = err
+		// log.Printf("[DEBUG] Attempt %d failed: %v", attempt+1, err)
 	}
 
+	// Escalation fallback path
+	return &AnalysisResult{
+		Category:        "Misc",
+		Title:           "Unknown_Doc",
+		ConfidenceScore: 0.0,
+	}, fmt.Errorf("failed to get valid structured output after %d retries: %w", maxRetries, lastErr)
+}
+
+func (e *MLXEngine) executeCategorization(ctx context.Context, reqBody chatRequest) (*AnalysisResult, error) {
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
@@ -148,29 +198,94 @@ Do NOT return a list. Do NOT return markdown. Do NOT return extra text.`
 	}
 
 	content := chatResp.Choices[0].Message.Content
+	return e.parseAndValidate(content)
+}
 
-	// Log raw response for debugging
-	// fmt.Printf("[DEBUG] Raw AI Response: %s\n", content)
-
+func (e *MLXEngine) parseAndValidate(content string) (*AnalysisResult, error) {
 	content = cleanJSON(content)
 
+	// Use decoder with DisallowUnknownFields for strict validation
 	var result AnalysisResult
-	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON from model output: %w. Cleaned output: %s", err, content)
+	dec := json.NewDecoder(strings.NewReader(content))
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&result); err != nil {
+		return nil, fmt.Errorf("invalid JSON or unexpected fields: %w", err)
 	}
 
-	result.Category = SanitizeFilename(result.Category)
-	result.Title = SanitizeFilename(result.Title)
+	// Check for trailing data to ensure strict validation
+	var dummy json.RawMessage
+	if err := dec.Decode(&dummy); err != io.EOF {
+		return nil, fmt.Errorf("trailing data after JSON object")
+	}
 
-	// Fallback/Safety for empty values
+	// Required fields validation
 	if result.Category == "" {
-		result.Category = "Misc"
+		return nil, fmt.Errorf("missing required field: category")
 	}
 	if result.Title == "" {
-		result.Title = "Unknown_Doc"
+		return nil, fmt.Errorf("missing required field: title")
+	}
+	if result.ConfidenceScore <= 0 {
+		// Even if provided, if it's 0 it might be missing or explicitly low
+		// We'll treat <= 0 as invalid per requirements "Required confidence_score"
+		return nil, fmt.Errorf("missing or invalid confidence_score: %v", result.ConfidenceScore)
 	}
 
+	// Enum validation
+	valid := false
+	for _, c := range e.validCategories {
+		if result.Category == c {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return nil, fmt.Errorf("invalid category: %s (must be one of %v)", result.Category, e.validCategories)
+	}
+
+	result.Category = SanitizeCategory(result.Category)
+	result.Title = SanitizeFilename(result.Title)
+
 	return &result, nil
+}
+
+// SanitizeCategory removes dangerous characters but allows forward slashes for nested paths.
+func SanitizeCategory(s string) string {
+	// Allow / but sanitize other path characters
+	s = strings.ReplaceAll(s, "\\", "_")
+	s = strings.ReplaceAll(s, ":", "_")
+	s = strings.ReplaceAll(s, "*", "_")
+	s = strings.ReplaceAll(s, "?", "_")
+	s = strings.ReplaceAll(s, "\"", "_")
+	s = strings.ReplaceAll(s, "<", "_")
+	s = strings.ReplaceAll(s, ">", "_")
+	s = strings.ReplaceAll(s, "|", "_")
+
+	var builder strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '_' || r == '-' || r == '.' || r == ' ' || r == '/' {
+			builder.WriteRune(r)
+		} else {
+			builder.WriteRune('_')
+		}
+	}
+
+	result := strings.TrimSpace(builder.String())
+	for strings.Contains(result, "__") {
+		result = strings.ReplaceAll(result, "__", "_")
+	}
+	// Avoid double slashes
+	for strings.Contains(result, "//") {
+		result = strings.ReplaceAll(result, "//", "/")
+	}
+	result = strings.Trim(result, ". _/")
+
+	if result == "" {
+		result = "unnamed"
+	}
+	return result
 }
 
 // SanitizeFilename removes dangerous characters from AI-generated strings

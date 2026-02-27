@@ -9,13 +9,15 @@ import (
 )
 
 type Config struct {
-	SourceDir     string `mapstructure:"src"`
-	DestDir       string `mapstructure:"dst"`
-	APIURL        string `mapstructure:"api"`
-	ModelName     string `mapstructure:"model"`
-	ContextWindow int    `mapstructure:"ctx"`
-	Workers       int    `mapstructure:"workers"`
-	ExtractLimit  int    `mapstructure:"limit"`
+	SourceDir     string   `mapstructure:"src"`
+	DestDir       string   `mapstructure:"dst"`
+	APIURL        string   `mapstructure:"api"`
+	ModelName     string   `mapstructure:"model"`
+	ContextWindow int      `mapstructure:"ctx"`
+	Encoding      string   `mapstructure:"encoding"`
+	Workers       int      `mapstructure:"workers"`
+	ExtractLimit  int      `mapstructure:"limit"`
+	Categories    []string `mapstructure:"categories"`
 }
 
 func LoadConfig() (*Config, error) {
@@ -23,6 +25,7 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("api", "http://localhost:8080/v1")
 	viper.SetDefault("model", "mlx-community/Llama-3.2-1B-Instruct-4bit")
 	viper.SetDefault("ctx", 4096)
+	viper.SetDefault("encoding", "cl100k_base")
 	viper.SetDefault("workers", 5)
 	viper.SetDefault("limit", 100000)
 
@@ -32,8 +35,10 @@ func LoadConfig() (*Config, error) {
 	pflag.String("api", "http://localhost:8080/v1", "URL of the MLX server")
 	pflag.String("model", "mlx-community/Llama-3.2-1B-Instruct-4bit", "Model name to use in API requests")
 	pflag.Int("ctx", 4096, "Model context window (max tokens)")
+	pflag.String("encoding", "cl100k_base", "Tiktoken encoding to use (e.g. cl100k_base, p50k_base)")
 	pflag.Int("workers", 5, "Number of concurrent workers")
 	pflag.Int("limit", 100000, "Max characters to extract from each file")
+	pflag.StringSlice("categories", []string{}, "Manual list of allowed categories (comma-separated)")
 	configPath := pflag.String("config", "", "Path to YAML configuration file")
 	pflag.Parse()
 

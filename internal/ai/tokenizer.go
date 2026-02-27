@@ -11,19 +11,11 @@ type Tokenizer struct {
 	encoding *tiktoken.Tiktoken
 }
 
-// NewTokenizer creates a new Tokenizer for the specified model.
-// Defaults to cl100k_base (GPT-4/3.5) if model is unknown.
-func NewTokenizer(model string) (*Tokenizer, error) {
-	// Llama 3 models often use cl100k_base or similar for estimation
-	// MLX models usually have their own tokenizer, but cl100k_base is a good proxy
-	// for OpenAI-compatible API responses if we don't have the exact vocab.
-	enc, err := tiktoken.EncodingForModel(model)
+// NewTokenizer creates a new Tokenizer using the specified encoding (e.g., cl100k_base).
+func NewTokenizer(encodingName string) (*Tokenizer, error) {
+	enc, err := tiktoken.GetEncoding(encodingName)
 	if err != nil {
-		// Fallback to cl100k_base if model mapping is missing
-		enc, err = tiktoken.GetEncoding("cl100k_base")
-		if err != nil {
-			return nil, fmt.Errorf("failed to get encoding: %w", err)
-		}
+		return nil, fmt.Errorf("failed to get encoding '%s': %w", encodingName, err)
 	}
 	return &Tokenizer{encoding: enc}, nil
 }

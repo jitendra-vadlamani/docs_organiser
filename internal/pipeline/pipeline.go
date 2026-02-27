@@ -6,6 +6,7 @@ import (
 	"docs_organiser/internal/extractor"
 	"docs_organiser/internal/fileops"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -50,6 +51,15 @@ func NewPipeline(src, dst string, aiEngine *ai.MLXEngine, workers, extractLimit 
 }
 
 func (p *Pipeline) Run(ctx context.Context) error {
+	// Step 0: Dynamic Category Discovery
+	discoveredCategories, err := p.discoverCategories()
+	if err != nil {
+		log.Printf("[!] Warning: Category discovery failed: %v. Using defaults.", err)
+	} else if len(discoveredCategories) > 0 {
+		log.Printf("[*] Discovered %d categories in %s", len(discoveredCategories), p.DestDir)
+		p.AI.SetCategories(discoveredCategories)
+	}
+
 	jobs := make(chan FileJob, p.Workers*2)
 	var wg sync.WaitGroup
 
@@ -95,7 +105,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	// Step 2: Scan and feed jobs in a stream
 	fmt.Println("[*] Scanning source directory...")
-	err := filepath.Walk(p.SourceDir, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(p.SourceDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -159,6 +169,66 @@ func (p *Pipeline) processFile(ctx context.Context, path string) {
 	} else {
 		atomic.AddInt32(&p.ProcessedFiles, 1)
 	}
+}
+
+func (p *Pipeline) discoverCategories() ([]string, error) {
+	var categories []string
+	maxDepth := 3
+
+	err := filepath.WalkDir(p.DestDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+
+		// Skip the root DestDir itself
+		if path == p.DestDir {
+			return nil
+		}
+
+		// Calculate depth relative to DestDir
+		rel, err := filepath.Rel(p.DestDir, path)
+		if err != nil {
+			return nil
+		}
+
+		segments := strings.Split(rel, string(os.PathSeparator))
+		if len(segments) > maxDepth {
+			return filepath.SkipDir
+		}
+
+		// Skip hidden directories
+		if strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
+
+		// Use forward slash uniformly for AI consistency
+		categories = append(categories, filepath.ToSlash(rel))
+		return nil
+	})
+
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	// Always include "Misc" if not already there
+	hasMisc := false
+	for _, c := range categories {
+		if c == "Misc" {
+			hasMisc = true
+			break
+		}
+	}
+	if !hasMisc {
+		categories = append(categories, "Misc")
+	}
+
+	return categories, nil
 }
 
 func (p *Pipeline) updateProgressDisplay() {

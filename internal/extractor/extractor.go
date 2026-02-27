@@ -38,6 +38,25 @@ func extractPDFText(path string, limit int) (text string, err error) {
 	defer f.Close()
 
 	var content strings.Builder
+
+	// Step 1: Extract Metadata (Title, Author, etc.)
+	pInfo := r.Trailer().Key("Info")
+	if !pInfo.IsNull() {
+		infoKeys := []string{"Title", "Author", "Subject", "Keywords"}
+		metadataLines := []string{"[METADATA]"}
+		foundMetadata := false
+		for _, key := range infoKeys {
+			val := pInfo.Key(key)
+			if !val.IsNull() {
+				metadataLines = append(metadataLines, fmt.Sprintf("%s: %s", key, val.String()))
+				foundMetadata = true
+			}
+		}
+		if foundMetadata {
+			content.WriteString(strings.Join(metadataLines, "\n") + "\n\n[CONTENT]\n")
+		}
+	}
+
 	totalPage := r.NumPage()
 
 	// Limit to first 50 pages to avoid massive memory consumption on huge PDFs

@@ -43,9 +43,13 @@ func main() {
 
 	// Initialize AI Engine
 	fmt.Println("[*] Initializing AI Engine...")
-	aiEngine, err := ai.NewMLXEngine(cfg.APIURL, cfg.ModelName, cfg.ContextWindow)
+	aiEngine, err := ai.NewMLXEngine(cfg.APIURL, cfg.ModelName, cfg.ContextWindow, cfg.Encoding)
 	if err != nil {
 		log.Fatalf("Failed to initialize AI engine: %v", err)
+	}
+	if len(cfg.Categories) > 0 {
+		aiEngine.SetCategories(cfg.Categories)
+		fmt.Printf("[*] Using %d manual categories from config.\n", len(cfg.Categories))
 	}
 	fmt.Println("[+] AI Engine initialized.")
 
