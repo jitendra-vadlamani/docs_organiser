@@ -6,6 +6,7 @@ import (
 	"docs_organiser/internal/config"
 	"docs_organiser/internal/extractor"
 	"docs_organiser/internal/fileops"
+	"docs_organiser/internal/observability"
 	"fmt"
 	"io/fs"
 	"log"
@@ -29,6 +30,7 @@ type Pipeline struct {
 	TotalFiles     int32
 	ProcessedFiles int32
 	FailedFiles    int32
+	ActiveWorkers  int32
 
 	// Flow Control
 	isPaused  bool
@@ -124,10 +126,14 @@ func (p *Pipeline) Run(ctx context.Context) error {
 					// Log the file being processed to identify "killer files"
 					log.Printf("[*] Processing: %s", filepath.Base(job.Path))
 
+					atomic.AddInt32(&p.ActiveWorkers, 1)
+					observability.ActiveWorkersGauge.Inc()
 					// Use a per-file timeout to prevent hanging workers
 					fileCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 					p.processFile(fileCtx, job.Path)
 					cancel()
+					observability.ActiveWorkersGauge.Dec()
+					atomic.AddInt32(&p.ActiveWorkers, -1)
 
 					p.updateProgressDisplay()
 
@@ -188,6 +194,7 @@ func (p *Pipeline) processFile(ctx context.Context, path string) {
 	text, err := extractor.ExtractText(path, effectiveLimit)
 	if err != nil {
 		log.Printf("[!] Failed to extract text from %s: %v", filepath.Base(path), err)
+		observability.ErrorsTotal.WithLabelValues("extraction").Inc()
 		atomic.AddInt32(&p.FailedFiles, 1)
 		return
 	}
@@ -220,6 +227,7 @@ func (p *Pipeline) processFile(ctx context.Context, path string) {
 
 	if err := fileops.MoveFile(path, finalDestDir, targetName); err != nil {
 		log.Printf("[!] Failed to move %s to %s/%s: %v", filepath.Base(path), targetFolder, targetName, err)
+		observability.ErrorsTotal.WithLabelValues("move").Inc()
 		atomic.AddInt32(&p.FailedFiles, 1)
 	} else {
 		atomic.AddInt32(&p.ProcessedFiles, 1)

@@ -154,12 +154,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total":      s.pipeline.TotalFiles,
-		"processed":  s.pipeline.ProcessedFiles,
-		"failed":     s.pipeline.FailedFiles,
-		"summary":    summary,
-		"is_running": isRunning,
-		"is_paused":  s.pipeline.IsPaused(),
+		"total":          s.pipeline.TotalFiles,
+		"processed":      s.pipeline.ProcessedFiles,
+		"failed":         s.pipeline.FailedFiles,
+		"active_workers": s.pipeline.ActiveWorkers,
+		"summary":        summary,
+		"is_running":     isRunning,
+		"is_paused":      s.pipeline.IsPaused(),
 	})
 }
 

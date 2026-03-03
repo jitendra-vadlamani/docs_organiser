@@ -391,8 +391,12 @@ Do NOT return extra fields. Do NOT return markdown. Do NOT return extra text.`, 
 				}, nil
 			}
 			lastErr = parseErr
+			observability.ErrorsTotal.WithLabelValues("parsing").Inc()
 		} else {
 			lastErr = err
+			if strings.Contains(err.Error(), "connection") || strings.Contains(err.Error(), "timeout") {
+				observability.ErrorsTotal.WithLabelValues("connection").Inc()
+			}
 		}
 	}
 
