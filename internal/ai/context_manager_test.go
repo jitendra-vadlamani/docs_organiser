@@ -6,7 +6,10 @@ import (
 )
 
 func TestContextManager_Truncate(t *testing.T) {
-	tokenizer, _ := NewTokenizer("gpt-4")
+	tokenizer, err := NewTokenizer("cl100k_base")
+	if err != nil {
+		t.Fatalf("failed to create tokenizer: %v", err)
+	}
 	cm := NewContextManager(tokenizer, 100)
 
 	longText := strings.Repeat("hello ", 200) // Much more than 100 tokens
@@ -40,7 +43,7 @@ func TestContextManager_Truncate(t *testing.T) {
 }
 
 func TestContextManager_Budgets(t *testing.T) {
-	tokenizer, _ := NewTokenizer("gpt-4")
+	tokenizer, _ := NewTokenizer("cl100k_base")
 	cm := NewContextManager(tokenizer, 1000)
 
 	s, e, c, o := cm.GetBudgets()

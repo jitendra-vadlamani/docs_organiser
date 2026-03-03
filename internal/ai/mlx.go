@@ -3,21 +3,90 @@ package ai
 import (
 	"bytes"
 	"context"
+	"docs_organiser/internal/config"
+	"docs_organiser/internal/observability"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
-// MLXEngine handles interaction with the MLX model server.
+// LLMClient defines the interface for interacting with any LLM server.
+type LLMClient interface {
+	CreateChatCompletion(ctx context.Context, req chatRequest) (*chatResponse, error)
+	Endpoint() string
+}
+
+// NetLLMClient is the standard HTTP implementation of LLMClient.
+type NetLLMClient struct {
+	client *http.Client
+	apiURL string
+}
+
+func (c *NetLLMClient) CreateChatCompletion(ctx context.Context, req chatRequest) (*chatResponse, error) {
+	jsonBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.apiURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("server error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var chatResp chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &chatResp, nil
+}
+
+func (c *NetLLMClient) Endpoint() string {
+	return c.apiURL
+}
+
+// MLXEngine handles interaction with the model servers.
 type MLXEngine struct {
-	apiURL          string
-	modelName       string
-	client          *http.Client
-	ctxMgr          *ContextManager
-	validCategories []string
+	llm              LLMClient
+	models           []config.ModelDefinition
+	defaultModelName string
+	ctxMgr           *ContextManager
+	validCategories  []string
+	mu               sync.RWMutex
+}
+
+// CategorizationMetadata holds telemetry and usage data for a request.
+type CategorizationMetadata struct {
+	Model          string        `json:"model"`
+	Latency        time.Duration `json:"latency"`
+	PromptTokens   int           `json:"prompt_tokens"`
+	ResponseTokens int           `json:"response_tokens"`
+	TotalTokens    int           `json:"total_tokens"`
+	TruncationType string        `json:"truncation_type"`
+	Attempts       int           `json:"attempts"`
+	Success        bool          `json:"success"`
+}
+
+// CategorizationResult combines the AI response with metadata.
+type CategorizationResult struct {
+	Analysis *AnalysisResult         `json:"analysis"`
+	Metadata *CategorizationMetadata `json:"metadata"`
 }
 
 // AnalysisResult is the structure we expect from the LLM.
@@ -49,6 +118,13 @@ type message struct {
 // OpenAI-compatible response structure
 type chatResponse struct {
 	Choices []choice `json:"choices"`
+	Usage   Usage    `json:"usage"`
+}
+
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 type choice struct {
@@ -56,19 +132,7 @@ type choice struct {
 }
 
 // NewMLXEngine creates a new instance of the engine.
-// apiURL should be the base URL, e.g., "http://localhost:8080/v1"
-// modelName is the model identifier to send in the request
-// maxTokens is the context window size
-// encodingName is the tiktoken encoding to use for token counting
-func NewMLXEngine(apiURL, modelName string, maxTokens int, encodingName string) (*MLXEngine, error) {
-	if apiURL == "" {
-		apiURL = "http://localhost:8080/v1"
-	}
-	// Ensure URL ends with /chat/completions if not provided
-	if !strings.HasSuffix(apiURL, "/chat/completions") {
-		apiURL = strings.TrimRight(apiURL, "/") + "/chat/completions"
-	}
-
+func NewMLXEngine(apiURL string, allowedModels []config.ModelDefinition, maxTokens int, encodingName string) (*MLXEngine, error) {
 	tokenizer, err := NewTokenizer(encodingName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize tokenizer: %w", err)
@@ -77,12 +141,19 @@ func NewMLXEngine(apiURL, modelName string, maxTokens int, encodingName string) 
 	// Use provided max tokens for context management
 	ctxMgr := NewContextManager(tokenizer, maxTokens)
 
+	if len(allowedModels) == 0 {
+		allowedModels = []config.ModelDefinition{
+			{Name: "mlx-community/Llama-3.2-1B-Instruct-4bit", URL: apiURL},
+		}
+	}
+
 	return &MLXEngine{
-		apiURL:    apiURL,
-		modelName: modelName,
-		client: &http.Client{
-			Timeout: 60 * time.Second,
+		llm: &NetLLMClient{
+			client: &http.Client{
+				Timeout: 60 * time.Second,
+			},
 		},
+		models:          allowedModels,
 		ctxMgr:          ctxMgr,
 		validCategories: DefaultCategories,
 	}, nil
@@ -90,13 +161,157 @@ func NewMLXEngine(apiURL, modelName string, maxTokens int, encodingName string) 
 
 // SetCategories overrides the allowed categorization folders.
 func (e *MLXEngine) SetCategories(categories []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if len(categories) > 0 {
 		e.validCategories = categories
 	}
 }
 
+// GetCategories returns the current list of allowed categories.
+func (e *MLXEngine) GetCategories() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.validCategories
+}
+
+// ContextWindow returns the maximum tokens allowed for the current context.
+func (e *MLXEngine) ContextWindow() int {
+	return e.ctxMgr.maxTokens
+}
+
+// SetDefaultModel sets the preferred model to use if available.
+func (e *MLXEngine) SetDefaultModel(name string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.defaultModelName = name
+}
+
+// SetAllowedModels updates the pool of models used for requests.
+func (e *MLXEngine) SetAllowedModels(models []config.ModelDefinition) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(models) > 0 {
+		e.models = models
+	}
+}
+
+// GetCurrentURL returns the URL of a specific model by name.
+func (e *MLXEngine) GetURLForModel(name string) string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, m := range e.models {
+		if m.Name == name {
+			return m.URL
+		}
+	}
+	return ""
+}
+
+// GetAvailableModelsForURL probes a specific endpoint for active models.
+func (e *MLXEngine) GetAvailableModelsForURL(ctx context.Context, apiURL string) ([]string, error) {
+	if apiURL == "" {
+		return nil, fmt.Errorf("empty API URL")
+	}
+	baseURL := strings.TrimRight(apiURL, "/") + "/models"
+	req, err := http.NewRequestWithContext(ctx, "GET", baseURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get models from %s: status %d", apiURL, resp.StatusCode)
+	}
+
+	var data struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	var models []string
+	for _, m := range data.Data {
+		models = append(models, m.ID)
+	}
+	return models, nil
+}
+
+func (e *MLXEngine) selectBestModel(ctx context.Context) (string, string) {
+	e.mu.RLock()
+	models := e.models
+	defaultModel := e.defaultModelName
+	e.mu.RUnlock()
+
+	// 1. Try default model first
+	if defaultModel != "" {
+		for _, m := range models {
+			if m.Name == defaultModel {
+				available, err := e.GetAvailableModelsForURL(ctx, m.URL)
+				if err == nil {
+					for _, avail := range available {
+						if m.Name == avail {
+							return m.Name, m.URL
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// 2. Otherwise try any active model in the pool
+	for _, m := range models {
+		available, err := e.GetAvailableModelsForURL(ctx, m.URL)
+		if err != nil {
+			continue // Try next provider
+		}
+		for _, avail := range available {
+			if m.Name == avail {
+				return m.Name, m.URL
+			}
+		}
+	}
+
+	// Fallback to first configured if nothing is active
+	if len(models) > 0 {
+		return models[0].Name, models[0].URL
+	}
+	return "", ""
+}
+
 // Categorize analyzes the text and returns a folder category and cleaned filename.
-func (e *MLXEngine) Categorize(ctx context.Context, text string) (*AnalysisResult, error) {
+func (e *MLXEngine) Categorize(ctx context.Context, text string) (*CategorizationResult, error) {
+	startTime := time.Now()
+	modelName, apiURL := e.selectBestModel(ctx)
+	if modelName == "" {
+		return nil, fmt.Errorf("no model available")
+	}
+
+	// For NetLLMClient, we need to inject the specific URL for this request
+	if net, ok := e.llm.(*NetLLMClient); ok {
+		fullURL := strings.TrimRight(apiURL, "/")
+		if !strings.HasSuffix(fullURL, "/chat/completions") {
+			fullURL += "/chat/completions"
+		}
+		net.apiURL = fullURL
+	}
+
+	metadata := &CategorizationMetadata{
+		Model:          modelName,
+		TruncationType: "none",
+		Success:        false,
+	}
+
 	systemPrompt := fmt.Sprintf(`You are an intelligent file organization assistant. Analyze the document text and return a SINGLE JSON object.
 Required format: {"category": "Specific_Category_Name", "title": "Clean_Filename_No_Ext", "confidence_score": 0.0-1.0}
 Strictly choose category from: %s
@@ -106,15 +321,19 @@ Do NOT return extra fields. Do NOT return markdown. Do NOT return extra text.`, 
 
 	systemBudget, _, contentBudget, _ := e.ctxMgr.GetBudgets()
 	systemPrompt = e.ctxMgr.Truncate(systemPrompt, systemBudget, StrategySlidingWindow)
+	// We don't record sliding window for system prompt as it's static/small usually
 
 	currentTokens := e.ctxMgr.tokenizer.CountTokens(text)
 	if currentTokens > contentBudget {
-		summary, err := e.MapReduceSummarize(ctx, text, contentBudget)
+		metadata.TruncationType = string(StrategyMapReduce)
+		summary, err := e.MapReduceSummarize(ctx, text, contentBudget, modelName, apiURL)
 		if err != nil {
+			metadata.TruncationType = string(StrategyMiddleExtraction)
 			text = e.ctxMgr.Truncate(text, contentBudget, StrategyMiddleExtraction)
 		} else {
 			text = summary
 		}
+		observability.TruncationEventsTotal.WithLabelValues(modelName, metadata.TruncationType).Inc()
 	}
 
 	userPrompt := fmt.Sprintf("Document text snippet:\n%s", text)
@@ -124,6 +343,7 @@ Do NOT return extra fields. Do NOT return markdown. Do NOT return extra text.`, 
 
 	// Correction loop
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		metadata.Attempts++
 		messages := []message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
@@ -142,63 +362,50 @@ Do NOT return extra fields. Do NOT return markdown. Do NOT return extra text.`, 
 		}
 
 		reqBody := chatRequest{
-			Model:       e.modelName,
+			Model:       modelName,
 			Messages:    messages,
 			Stream:      false,
 			Temperature: 0.1,
 		}
 
-		result, err := e.executeCategorization(ctx, reqBody)
-		if err == nil {
-			return result, nil
+		chatResp, err := e.llm.CreateChatCompletion(ctx, reqBody)
+		if err == nil && len(chatResp.Choices) > 0 {
+			metadata.PromptTokens += chatResp.Usage.PromptTokens
+			metadata.ResponseTokens += chatResp.Usage.CompletionTokens
+			metadata.TotalTokens += chatResp.Usage.TotalTokens
+
+			// Update Prometheus metrics
+			observability.LLMTokensTotal.WithLabelValues(modelName, "prompt").Add(float64(chatResp.Usage.PromptTokens))
+			observability.LLMTokensTotal.WithLabelValues(modelName, "completion").Add(float64(chatResp.Usage.CompletionTokens))
+			observability.LLMTokensTotal.WithLabelValues(modelName, "total").Add(float64(chatResp.Usage.TotalTokens))
+
+			content := chatResp.Choices[0].Message.Content
+			result, parseErr := e.parseAndValidate(content)
+			if parseErr == nil {
+				metadata.Success = true
+				metadata.Latency = time.Since(startTime)
+				observability.LLMRequestDuration.WithLabelValues(modelName, "categorization").Observe(metadata.Latency.Seconds())
+				return &CategorizationResult{
+					Analysis: result,
+					Metadata: metadata,
+				}, nil
+			}
+			lastErr = parseErr
+		} else {
+			lastErr = err
 		}
-
-		lastErr = err
-		// log.Printf("[DEBUG] Attempt %d failed: %v", attempt+1, err)
 	}
 
+	metadata.Latency = time.Since(startTime)
 	// Escalation fallback path
-	return &AnalysisResult{
-		Category:        "Misc",
-		Title:           "Unknown_Doc",
-		ConfidenceScore: 0.0,
-	}, fmt.Errorf("failed to get valid structured output after %d retries: %w", maxRetries, lastErr)
-}
-
-func (e *MLXEngine) executeCategorization(ctx context.Context, reqBody chatRequest) (*AnalysisResult, error) {
-	jsonBody, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", e.apiURL, bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request to MLX server: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("MLX server error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var chatResp chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(chatResp.Choices) == 0 {
-		return nil, fmt.Errorf("no choices in response")
-	}
-
-	content := chatResp.Choices[0].Message.Content
-	return e.parseAndValidate(content)
+	return &CategorizationResult{
+		Analysis: &AnalysisResult{
+			Category:        "Misc",
+			Title:           "Unknown_Doc",
+			ConfidenceScore: 0.0,
+		},
+		Metadata: metadata,
+	}, fmt.Errorf("failed to get valid structured output after %d retries using model %s: %w", maxRetries, modelName, lastErr)
 }
 
 func (e *MLXEngine) parseAndValidate(content string) (*AnalysisResult, error) {
@@ -330,7 +537,7 @@ func SanitizeFilename(s string) string {
 }
 
 // MapReduceSummarize reduces a large text into a shorter summary that fits within limit tokens.
-func (e *MLXEngine) MapReduceSummarize(ctx context.Context, text string, limit int) (string, error) {
+func (e *MLXEngine) MapReduceSummarize(ctx context.Context, text string, limit int, modelName, apiURL string) (string, error) {
 	currentTokens := e.ctxMgr.tokenizer.CountTokens(text)
 	if currentTokens <= limit {
 		return text, nil
@@ -345,30 +552,39 @@ func (e *MLXEngine) MapReduceSummarize(ctx context.Context, text string, limit i
 	// 2. Map: Summarize each chunk
 	var summaries []string
 	for i, chunk := range chunks {
-		summary, err := e.summarizeChunk(ctx, chunk, i+1, len(chunks))
+		summary, err := e.summarizeChunk(ctx, chunk, i+1, len(chunks), modelName, apiURL)
 		if err != nil {
 			return "", fmt.Errorf("failed to summarize chunk %d/%d: %w", i+1, len(chunks), err)
 		}
 		summaries = append(summaries, summary)
 	}
 
-	// 3. Reduce: Combine and recursively summarize if needed
+	// 3. Reduce: Combined and recursively summarize if needed
 	combined := strings.Join(summaries, "\n\n")
 	combinedTokens := e.ctxMgr.tokenizer.CountTokens(combined)
 
 	if combinedTokens > limit {
 		// Recursive reduction
-		return e.MapReduceSummarize(ctx, combined, limit)
+		return e.MapReduceSummarize(ctx, combined, limit, modelName, apiURL)
 	}
 
 	return combined, nil
 }
 
-func (e *MLXEngine) summarizeChunk(ctx context.Context, text string, index, total int) (string, error) {
+func (e *MLXEngine) summarizeChunk(ctx context.Context, text string, index, total int, modelName, apiURL string) (string, error) {
+	// Ensure URL is set for the client
+	if net, ok := e.llm.(*NetLLMClient); ok {
+		fullURL := strings.TrimRight(apiURL, "/")
+		if !strings.HasSuffix(fullURL, "/chat/completions") {
+			fullURL += "/chat/completions"
+		}
+		net.apiURL = fullURL
+	}
+
 	prompt := fmt.Sprintf("Summarize the following document part (%d/%d). Keep key technical details, names, and core topics relevant for categorization:\n\n%s", index, total, text)
 
 	reqBody := chatRequest{
-		Model: e.modelName,
+		Model: modelName,
 		Messages: []message{
 			{Role: "system", Content: "You are a concise summarization assistant. Provide a brief but information-dense summary."},
 			{Role: "user", Content: prompt},
@@ -377,30 +593,8 @@ func (e *MLXEngine) summarizeChunk(ctx context.Context, text string, index, tota
 		Temperature: 0.1,
 	}
 
-	jsonBody, err := json.Marshal(reqBody)
+	chatResp, err := e.llm.CreateChatCompletion(ctx, reqBody)
 	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", e.apiURL, bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("server error %d: %s", resp.StatusCode, string(body))
-	}
-
-	var chatResp chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
 		return "", err
 	}
 

@@ -1,13 +1,15 @@
 package ai
 
 import (
+	"docs_organiser/internal/config"
 	"fmt"
 	"testing"
 )
 
 func TestParseAndValidate(t *testing.T) {
-	// Initialize engine to test its private method
-	engine, _ := NewMLXEngine("http://localhost:8080/v1", "test-model", 4096, "cl100k_base")
+	engine, _ := NewMLXEngine("http://localhost:8080/v1", []config.ModelDefinition{
+		{Name: "test-model", URL: "http://localhost:8080/v1"},
+	}, 4096, "cl100k_base")
 	engine.SetCategories([]string{"Personal", "Work", "Work/Projects", "Finance"})
 
 	tests := []struct {

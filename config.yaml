@@ -1,0 +1,9 @@
+# Docs Organiser Infrastructure Config
+# Strictly for server settings. User settings (models, paths) are managed via UI.
+
+server_port: 8090
+metrics_enabled: true
+metrics_port: 8081
+api: "http://host.docker.internal:8080/v1"
+encoding: "cl100k_base"
+ctx: 4096

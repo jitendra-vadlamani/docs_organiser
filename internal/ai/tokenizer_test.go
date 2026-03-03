@@ -11,14 +11,14 @@ func TestNewTokenizer(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			"Valid OpenAI model",
-			"gpt-4",
+			"Valid encoding",
+			"cl100k_base",
 			false,
 		},
 		{
-			"Unknown model fallback",
-			"unknown-model-123",
-			false, // Should fallback to cl100k_base
+			"Invalid encoding",
+			"invalid-encoding-name",
+			true,
 		},
 	}
 
@@ -33,7 +33,7 @@ func TestNewTokenizer(t *testing.T) {
 }
 
 func TestTokenizer_CountTokens(t *testing.T) {
-	tokenizer, err := NewTokenizer("gpt-4")
+	tokenizer, err := NewTokenizer("cl100k_base")
 	if err != nil {
 		t.Fatalf("failed to create tokenizer: %v", err)
 	}

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"docs_organiser/internal/ai"
+	"docs_organiser/internal/config"
 	"docs_organiser/internal/extractor"
 	"docs_organiser/internal/fileops"
 	"fmt"
@@ -28,6 +29,11 @@ type Pipeline struct {
 	TotalFiles     int32
 	ProcessedFiles int32
 	FailedFiles    int32
+
+	// Flow Control
+	isPaused  bool
+	pauseMu   sync.Mutex
+	pauseCond *sync.Cond
 }
 
 type FileJob struct {
@@ -38,26 +44,56 @@ func NewPipeline(src, dst string, aiEngine *ai.MLXEngine, workers, extractLimit 
 	if workers <= 0 {
 		workers = 5
 	}
-	if extractLimit <= 0 {
-		extractLimit = 100000
-	}
-	return &Pipeline{
+	// extractLimit: 0 means "Auto"
+	p := &Pipeline{
 		SourceDir:    src,
 		DestDir:      dst,
 		AI:           aiEngine,
 		Workers:      workers,
 		ExtractLimit: extractLimit,
 	}
+	p.pauseCond = sync.NewCond(&p.pauseMu)
+	return p
+}
+
+func (p *Pipeline) Pause() {
+	p.pauseMu.Lock()
+	p.isPaused = true
+	p.pauseMu.Unlock()
+}
+
+func (p *Pipeline) Resume() {
+	p.pauseMu.Lock()
+	p.isPaused = false
+	p.pauseMu.Unlock()
+	p.pauseCond.Broadcast()
+}
+
+func (p *Pipeline) IsPaused() bool {
+	p.pauseMu.Lock()
+	defer p.pauseMu.Unlock()
+	return p.isPaused
+}
+
+func (p *Pipeline) waitIfPaused() {
+	p.pauseMu.Lock()
+	for p.isPaused {
+		p.pauseCond.Wait()
+	}
+	p.pauseMu.Unlock()
 }
 
 func (p *Pipeline) Run(ctx context.Context) error {
-	// Step 0: Dynamic Category Discovery
-	discoveredCategories, err := p.discoverCategories()
-	if err != nil {
-		log.Printf("[!] Warning: Category discovery failed: %v. Using defaults.", err)
-	} else if len(discoveredCategories) > 0 {
-		log.Printf("[*] Discovered %d categories in %s", len(discoveredCategories), p.DestDir)
-		p.AI.SetCategories(discoveredCategories)
+	var err error
+	if len(p.AI.GetCategories()) == 0 {
+		var discoveredCategories []string
+		discoveredCategories, err = p.discoverCategories()
+		if err != nil {
+			log.Printf("[!] Warning: Category discovery failed: %v. Using defaults.", err)
+		} else if len(discoveredCategories) > 0 {
+			log.Printf("[*] Discovered %d categories in %s", len(discoveredCategories), p.DestDir)
+			p.AI.SetCategories(discoveredCategories)
+		}
 	}
 
 	jobs := make(chan FileJob, p.Workers*2)
@@ -76,6 +112,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 				}
 			}()
 			for {
+				p.waitIfPaused()
 				select {
 				case <-ctx.Done():
 					return
@@ -106,6 +143,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	// Step 2: Scan and feed jobs in a stream
 	fmt.Println("[*] Scanning source directory...")
 	err = filepath.Walk(p.SourceDir, func(path string, info os.FileInfo, err error) error {
+		p.waitIfPaused()
 		if err != nil {
 			return err
 		}
@@ -140,7 +178,14 @@ func (p *Pipeline) Run(ctx context.Context) error {
 }
 
 func (p *Pipeline) processFile(ctx context.Context, path string) {
-	text, err := extractor.ExtractText(path, p.ExtractLimit)
+	effectiveLimit := p.ExtractLimit
+	if effectiveLimit <= 0 {
+		// Heuristic: 1 token is roughly 4 characters, but for extraction we can be more generous
+		// and let the AI truncate/summarize later. 10 chars per token is a safe upper bound.
+		effectiveLimit = p.AI.ContextWindow() * 10
+	}
+
+	text, err := extractor.ExtractText(path, effectiveLimit)
 	if err != nil {
 		log.Printf("[!] Failed to extract text from %s: %v", filepath.Base(path), err)
 		atomic.AddInt32(&p.FailedFiles, 1)
@@ -157,8 +202,18 @@ func (p *Pipeline) processFile(ctx context.Context, path string) {
 	targetName := ai.SanitizeFilename(filepath.Base(path))
 
 	if err == nil {
-		targetFolder = result.Category
-		targetName = result.Title + filepath.Ext(path)
+		targetFolder = result.Analysis.Category
+		targetName = result.Analysis.Title + filepath.Ext(path)
+
+		// Log detailed metadata for observability
+		log.Printf("[+] AI: %s | Latency: %v | Tokens: %d (%d/%d) | Trunc: %s | Attempts: %d",
+			result.Metadata.Model,
+			result.Metadata.Latency,
+			result.Metadata.TotalTokens,
+			result.Metadata.PromptTokens,
+			result.Metadata.ResponseTokens,
+			result.Metadata.TruncationType,
+			result.Metadata.Attempts)
 	}
 
 	finalDestDir := filepath.Join(p.DestDir, targetFolder)
@@ -246,4 +301,8 @@ func (p *Pipeline) updateProgressDisplay() {
 func (p *Pipeline) GetSummary() string {
 	return fmt.Sprintf("\nSummary:\n- Total Files:     %d\n- Successfully Moved: %d\n- Failed/Skipped:     %d\n",
 		p.TotalFiles, atomic.LoadInt32(&p.ProcessedFiles), atomic.LoadInt32(&p.FailedFiles))
+}
+
+func (p *Pipeline) SetModel(name, url string) {
+	p.AI.SetAllowedModels([]config.ModelDefinition{{Name: name, URL: url}})
 }

@@ -1,22 +1,41 @@
-.PHONY: all build install clean test
-
-BINARY_NAME=docs_organiser
-GOPATH=$(shell go env GOPATH)
-
-all: build
+.PHONY: build run test docker-build docker-up docker-down clean
 
 build:
-	@echo "Building $(BINARY_NAME)..."
-	go build -o $(BINARY_NAME) .
+	cd ui && npm run build
+	go build -o docs-organiser main.go
 
-install: build
-	@echo "Installing $(BINARY_NAME) to $(GOPATH)/bin..."
-	cp $(BINARY_NAME) $(GOPATH)/bin/
-
-clean:
-	@echo "Cleaning up..."
-	rm -f $(BINARY_NAME)
+run: build stop
+	./docs-organiser --src ./tmp/source --dst ./tmp/dest
 
 test:
-	@echo "Running tests..."
-	go test ./...
+	go test ./internal/... -v
+
+docker-build:
+	docker build -t docs-organiser .
+
+docker-up:
+	docker-compose up --build
+
+docker-down:
+	docker-compose down
+
+stop:
+	@echo "[*] Cleaning up existing processes on ports 8081, 8090..."
+	@lsof -ti:8081,8090 | xargs kill -9 2>/dev/null || true
+
+clean:
+	rm -f docs-organiser
+	rm -rf ui/dist
+
+start-local: build stop
+	./docs-organiser
+
+dev-ui:
+	cd ui && npm run dev
+
+dev-server: stop
+	go run main.go
+
+dev: stop
+	@echo "[*] Starting unified dev mode (UI on :5173, Server on :8090)..."
+	@make -j 2 dev-ui dev-server
