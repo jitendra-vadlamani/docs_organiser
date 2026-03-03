@@ -67,6 +67,7 @@ type MLXEngine struct {
 	models           []config.ModelDefinition
 	defaultModelName string
 	ctxMgr           *ContextManager
+	router           *ModelRouter
 	validCategories  []string
 	mu               sync.RWMutex
 }
@@ -147,7 +148,7 @@ func NewMLXEngine(apiURL string, allowedModels []config.ModelDefinition, maxToke
 		}
 	}
 
-	return &MLXEngine{
+	engine := &MLXEngine{
 		llm: &NetLLMClient{
 			client: &http.Client{
 				Timeout: 60 * time.Second,
@@ -156,7 +157,9 @@ func NewMLXEngine(apiURL string, allowedModels []config.ModelDefinition, maxToke
 		models:          allowedModels,
 		ctxMgr:          ctxMgr,
 		validCategories: DefaultCategories,
-	}, nil
+	}
+	engine.router = NewModelRouter(engine)
+	return engine, nil
 }
 
 // SetCategories overrides the allowed categorization folders.
@@ -292,7 +295,12 @@ func (e *MLXEngine) selectBestModel(ctx context.Context) (string, string) {
 // Categorize analyzes the text and returns a folder category and cleaned filename.
 func (e *MLXEngine) Categorize(ctx context.Context, text string) (*CategorizationResult, error) {
 	startTime := time.Now()
-	modelName, apiURL := e.selectBestModel(ctx)
+
+	// 1. Classify Task Complexity
+	complexity, _ := e.router.ClassifyTask(ctx, text)
+
+	// 2. Select the Best Model for this task
+	modelName, apiURL := e.router.SelectBestModel(ctx, complexity)
 	if modelName == "" {
 		return nil, fmt.Errorf("no model available")
 	}
