@@ -13,6 +13,11 @@ func TestCategorize_Robustness(t *testing.T) {
 	t.Run("Success on first attempt", func(t *testing.T) {
 		mock := &MockLLMClient{
 			Responses: []*chatResponse{
+				// Consumed by router.ClassifyTask's classification pass.
+				{
+					Choices: []choice{{Message: message{Content: "simple"}}},
+					Usage:   Usage{PromptTokens: 5, CompletionTokens: 1, TotalTokens: 6},
+				},
 				{
 					Choices: []choice{{Message: message{Content: `{"category": "Work", "title": "Report", "confidence_score": 0.9}`}}},
 					Usage:   Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
@@ -26,6 +31,7 @@ func TestCategorize_Robustness(t *testing.T) {
 			ctxMgr:          ctxMgr,
 			validCategories: []string{"Work", "Personal"},
 		}
+		engine.router = NewModelRouter(engine)
 
 		result, err := engine.Categorize(context.Background(), "some text")
 		if err != nil {
@@ -46,6 +52,11 @@ func TestCategorize_Robustness(t *testing.T) {
 	t.Run("Retry on malformed JSON", func(t *testing.T) {
 		mock := &MockLLMClient{
 			Responses: []*chatResponse{
+				// Consumed by router.ClassifyTask's classification pass.
+				{
+					Choices: []choice{{Message: message{Content: "simple"}}},
+					Usage:   Usage{PromptTokens: 5, CompletionTokens: 1, TotalTokens: 6},
+				},
 				{
 					Choices: []choice{{Message: message{Content: `invalid json`}}},
 					Usage:   Usage{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12},
@@ -63,6 +74,7 @@ func TestCategorize_Robustness(t *testing.T) {
 			ctxMgr:          ctxMgr,
 			validCategories: []string{"Work", "Personal"},
 		}
+		engine.router = NewModelRouter(engine)
 
 		result, err := engine.Categorize(context.Background(), "some text")
 		if err != nil {

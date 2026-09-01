@@ -78,6 +78,8 @@ func TestCategorize_MalformedOutputRobustness(t *testing.T) {
 
 			mock := &MockLLMClient{
 				Responses: []*chatResponse{
+					// Consumed by router.ClassifyTask's classification pass.
+					{Choices: []choice{{Message: message{Role: "assistant", Content: "simple"}}}},
 					{Choices: []choice{{Message: message{Role: "assistant", Content: tc.content}}}},
 					{Choices: []choice{{Message: message{Role: "assistant", Content: tc.content}}}},
 					{Choices: []choice{{Message: message{Role: "assistant", Content: tc.content}}}},
@@ -90,6 +92,7 @@ func TestCategorize_MalformedOutputRobustness(t *testing.T) {
 				ctxMgr:          ctxMgr,
 				validCategories: validCats,
 			}
+			engine.router = NewModelRouter(engine)
 
 			result, err := engine.Categorize(context.Background(), "test text")
 
