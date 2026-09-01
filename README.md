@@ -1,5 +1,7 @@
 # MLX-Powered File Mover
 
+[![CI](https://github.com/jitendra-vadlamani/docs_organiser/actions/workflows/ci.yml/badge.svg)](https://github.com/jitendra-vadlamani/docs_organiser/actions/workflows/ci.yml)
+
 A standalone Go application that uses a local MLX AI model (via HTTP) to intelligently categorize and move documents.
 
 ## Features

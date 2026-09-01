@@ -1,15 +1,14 @@
-import * as reactPlugin from 'vite-plugin-react'
-import type { UserConfig } from 'vite'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
 
-const config: UserConfig = {
-  jsx: 'react',
-  plugins: [reactPlugin],
-  proxy: {
-    '/v1': {
-      target: 'http://localhost:8090',
-      changeOrigin: true
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    proxy: {
+      '/v1': {
+        target: 'http://localhost:8090',
+        changeOrigin: true
+      }
     }
   }
-}
-
-export default config
+})
